@@ -1,0 +1,135 @@
+# Publishes the released wheels to PyPI via Trusted Publishing (OIDC; no API
+# token secret). release.yml's publish job dispatches this explicitly after
+# undrafting (GITHUB_TOKEN-published releases fire no `release: published`
+# workflow runs); the `release: published` trigger covers hand-published
+# releases. The manual dispatch re-publishes a given (or the latest) release
+# if an upload failed. `skip-existing` makes partial-upload recovery work: a
+# re-run uploads the missing files and skips the ones PyPI already has —
+# byte divergence is impossible because every staged file is checksum-pinned
+# to the release's SHA256SUMS below before upload.
+#
+# STAGED ONLY: the PyPI Trusted Publisher for this repository + workflow is
+# NOT configured yet. Until a PyPI project owner registers it, every upload
+# attempt is refused by PyPI and nothing publishes. Do not configure the
+# publisher before launch sign-off.
+#
+# PEP 740 attestation caveat: this repo commits PREBUILT wheels (there is no
+# build step here — the SDK source is not in this repository). The pypa
+# publish action's default attestations therefore attest that THIS workflow
+# uploaded these exact files from this repo/ref; they are provenance for the
+# upload, not for the original build environment. Cross-check a wheel's
+# sha256 against the release's SHA256SUMS and dist/metadata.json for the
+# build-side chain.
+
+name: Publish PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Published release tag to upload (defaults to the latest release)'
+        type: string
+        required: false
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # read releases + checkout
+      id-token: write # PyPI Trusted Publishing (OIDC)
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-${INPUT_TAG}}"
+          if [[ -z "${tag}" ]]; then
+            tag="$(gh release view --json tagName --jq .tagName)"
+          fi
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected release tag: ${tag}"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      # A published release has a real tag; checking it out pins dist/ to the
+      # exact commit the release was cut from, independent of main HEAD.
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Stage and verify wheels
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="$(jq -er '.version' dist/metadata.json)"
+
+          mkdir -p staging
+          cp dist/perplexity_sdk-*.whl staging/
+
+          wheels=(staging/*.whl)
+          if [[ "${#wheels[@]}" -ne 4 ]]; then
+            echo "::error::expected exactly 4 wheels in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          for w in staging/*.whl; do
+            name="$(basename "$w")"
+            if [[ ! "${name}" =~ ^perplexity_sdk-${version}-cp312-abi3-[A-Za-z0-9_]+\.whl$ ]]; then
+              echo "::error::unexpected wheel filename: ${name}"
+              exit 1
+            fi
+          done
+
+          # Anchor the committed files to the published release's checksums:
+          # what lands on PyPI is byte-identical to the verified GH assets.
+          # SHA256SUMS must cover ALL four staged wheels by name — sha256sum -c
+          # only checks the lines it is given, so a short file would silently
+          # leave wheels unverified.
+          gh release download "${TAG}" --pattern SHA256SUMS --output /tmp/SHA256SUMS
+          covered="$(grep -c '\.whl$' /tmp/SHA256SUMS || true)"
+          if [[ "${covered}" -ne 4 ]]; then
+            echo "::error::SHA256SUMS covers ${covered} wheels, expected 4"
+            exit 1
+          fi
+          for w in staging/*.whl; do
+            name="$(basename "$w")"
+            if ! grep -q " ${name}$" /tmp/SHA256SUMS; then
+              echo "::error::SHA256SUMS has no entry for ${name}"
+              exit 1
+            fi
+          done
+          (cd staging && grep '\.whl$' /tmp/SHA256SUMS | sha256sum -c -)
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: staging
+          # Partial-upload recovery: re-runs upload the missing wheels and
+          # skip the ones already on PyPI (bytes are pinned to SHA256SUMS
+          # above, so a skip can never hide divergence). A fully-published
+          # re-run becomes a no-op instead of a hard failure.
+          skip-existing: true

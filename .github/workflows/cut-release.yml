@@ -1,0 +1,199 @@
+# Cuts a public release whenever the upstream release-sync job lands a new
+# dist/ payload on main, then hands off to release.yml (stage -> smoke -> publish).
+#
+# Design notes:
+# - The human gate is upstream (the release-sync job is manually triggered); this
+#   workflow is fully automatic and uses only GITHUB_TOKEN (no PAT, no PRs, no admin).
+# - Releases created here are DRAFTS: no events fire, no git tag exists, and
+#   releases/latest is unaffected until release.yml's publish job uploads all
+#   assets and flips the draft to published.
+# - GITHUB_TOKEN-created releases/tags never trigger other workflows, so the
+#   handoff to release.yml is an explicit `gh workflow run` (workflow_dispatch
+#   is the documented exception that always starts runs).
+# - The `paths:` filter is an economy filter only; correctness comes from the
+#   in-job idempotency guard (dist-version marker in the release body). Never
+#   strip that HTML comment when editing release notes, or a re-run will try
+#   to cut the version again.
+# - Stale drafts (superseded versions) must be DELETED, never published by
+#   hand: publishing an asset-less draft creates a real tag, fires the PyPI
+#   publish workflow with nothing verified, and can mis-point releases/latest.
+
+name: Cut Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - dist/metadata.json
+  # Backfill / recovery: re-run detection for whatever dist/ is at main HEAD.
+  workflow_dispatch: {}
+
+permissions: {}
+
+# Serialize runs so tag computation + draft creation never race.
+# cancel-in-progress must stay false: a running cut is never killed; one newest
+# pending run waits and older pending runs are superseded (intermediate
+# metadata.json pushes collapse into the newest run, which is intended).
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  cut:
+    name: Detect dist version and cut draft release
+    # push is already main-scoped; this extends the same provenance gate to
+    # manual dispatch (which can otherwise target any ref).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # list/create/edit releases
+      actions: write # dispatch release.yml
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Read dist metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ ! -f dist/metadata.json ]]; then
+            echo "::error::missing dist/metadata.json at ${GITHUB_SHA}"
+            exit 1
+          fi
+          version="$(jq -er '.version' dist/metadata.json)"
+          source_commit="$(jq -er '.source_commit' dist/metadata.json)"
+          # Whole-string anchors (no per-line grep) so multi-line values cannot
+          # smuggle extra $GITHUB_OUTPUT lines.
+          if [[ ! "${version}" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::unexpected version format in dist/metadata.json: ${version}"
+            exit 1
+          fi
+          if [[ ! "${source_commit}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::unexpected source_commit format in dist/metadata.json: ${source_commit}"
+            exit 1
+          fi
+          # Repo-bootstrap placeholder: the initial dist/metadata.json ships
+          # version 0.0.0 with no wheels. Never cut a release for it.
+          if [[ "${version}" == "0.0.0" ]]; then
+            echo "::notice::dist/metadata.json holds the 0.0.0 bootstrap placeholder; nothing to release."
+          fi
+          {
+            echo "version=${version}"
+            echo "source_commit=${source_commit}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify dist payload
+        if: steps.meta.outputs.version != '0.0.0'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The release-sync job rewrites dist/ wholesale as metadata.json +
+          # exactly these four wheels; refuse anything partial or renamed.
+          for tag in manylinux2014_x86_64 manylinux2014_aarch64 macosx_11_0_x86_64 macosx_11_0_arm64; do
+            wheel="perplexity_sdk-${VERSION}-cp312-abi3-${tag}.whl"
+            if [[ ! -f "dist/${wheel}" ]]; then
+              echo "::error::missing dist/${wheel} at ${GITHUB_SHA}"
+              exit 1
+            fi
+          done
+
+      - name: Resolve release for this version
+        if: steps.meta.outputs.version != '0.0.0'
+        id: resolve
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          marker="<!-- pplx-dist-version: ${VERSION} -->"
+
+          # Draft releases have no git tag, so the REST list (which includes
+          # drafts for tokens with push access) is the source of truth.
+          gh api --paginate "repos/${GH_REPO}/releases" > /tmp/releases.json
+
+          match="$(jq -cs --arg marker "${marker}" \
+            'first(add[]? | select((.body // "") | contains($marker)) | {id, tag_name, draft}) // empty' \
+            /tmp/releases.json)"
+
+          if [[ -n "${match}" ]]; then
+            tag="$(jq -r '.tag_name' <<<"${match}")"
+            draft="$(jq -r '.draft' <<<"${match}")"
+            release_id="$(jq -r '.id' <<<"${match}")"
+            if [[ "${draft}" == "false" ]]; then
+              echo "Version ${VERSION} already published as ${tag}; nothing to do."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Version ${VERSION} already has draft ${tag} (a prior run stalled); re-dispatching the pipeline."
+            {
+              echo "action=reuse"
+              echo "tag=${tag}"
+              echo "release_id=${release_id}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Tag is always v{version}: SDK versions are clean semver, so the
+          # git tag, dist/metadata.json version, and PyPI version all match.
+          echo "Version ${VERSION} is unreleased; cutting tag v${VERSION}."
+          {
+            echo "action=create"
+            echo "tag=v${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        if: steps.resolve.outputs.action == 'create'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.meta.outputs.source_commit }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          body="$(printf '%s\n' \
+            "perplexity-sdk \`${VERSION}\` (build commit \`${SOURCE_COMMIT}\`)." \
+            "" \
+            "Install with \`pip install perplexity-sdk\`; the four platform wheels, manifest.json and SHA256SUMS are attached by the release pipeline." \
+            "" \
+            "<!-- pplx-dist-version: ${VERSION} -->")"
+          gh api -X POST "repos/${GH_REPO}/releases" \
+            -f tag_name="${TAG}" \
+            -f target_commitish="${GITHUB_SHA}" \
+            -f name="${TAG}" \
+            -f body="${body}" \
+            -F draft=true \
+            -F generate_release_notes=true \
+            --jq '.html_url'
+
+      - name: Retarget existing draft
+        if: steps.resolve.outputs.action == 'reuse'
+        env:
+          RELEASE_ID: ${{ steps.resolve.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            -f target_commitish="${GITHUB_SHA}" \
+            --jq '.html_url'
+
+      # Explicit allowlist, not `!= 'skip'`: when the resolve step itself was
+      # skipped (0.0.0 bootstrap), its outputs are empty strings.
+      - name: Dispatch release pipeline
+        if: steps.resolve.outputs.action == 'create' || steps.resolve.outputs.action == 'reuse'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAG}" ]]; then
+            echo "::error::resolved tag is empty; refusing to dispatch"
+            exit 1
+          fi
+          gh workflow run release.yml --ref main \
+            -f dry_run=false \
+            -f tag_name="${TAG}" \
+            -f sha="${GITHUB_SHA}"
+          echo "Dispatched release.yml for ${TAG} @ ${GITHUB_SHA}"

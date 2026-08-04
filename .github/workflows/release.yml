@@ -1,0 +1,267 @@
+# Stages, smoke-tests, and publishes the wheel assets for a release cut by
+# cut-release.yml. Draft releases fire no events, so this is normally started
+# by cut-release.yml's explicit `gh workflow run` handoff (workflow_dispatch);
+# the `release: created` trigger covers hand-cut releases.
+
+name: Release
+
+on:
+  release:
+    types:
+      - created
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (stage and verify only, no upload)'
+        type: boolean
+        required: false
+        default: true
+      tag_name:
+        description: 'Release tag to stage and publish (set by the Cut Release handoff)'
+        type: string
+        required: false
+        default: ''
+      sha:
+        description: 'Commit SHA to stage from (defaults to the dispatched ref)'
+        type: string
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag_name || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    name: Stage release assets
+    runs-on: ubuntu-latest
+
+    steps:
+      # Pin the checkout to the release's actual content. A published release
+      # has a real tag — use it. A draft has no tag yet, so the Cut Release
+      # handoff passes the explicit SHA it retargeted the draft to; bare
+      # target_commitish is the last resort (it can be a branch NAME, which
+      # drifts with later pushes — only hand-cut drafts ever hit that arm).
+      - name: Checkout release content
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ (github.event_name == 'release' && !github.event.release.draft && github.event.release.tag_name) || inputs.sha || github.event.release.target_commitish || github.ref }}
+
+      - name: Verify dist contents
+        run: |
+          set -euo pipefail
+
+          version="$(jq -er '.version' dist/metadata.json)"
+
+          # Wheel-set assertion: exactly four cp312/abi3 wheels whose PEP 425
+          # platform tags are exactly the supported set — no extras, no
+          # renames, no partial payloads.
+          expected_tags="$(printf '%s\n' \
+            macosx_11_0_arm64 \
+            macosx_11_0_x86_64 \
+            manylinux2014_aarch64 \
+            manylinux2014_x86_64)"
+          actual_tags="$(
+            for w in dist/perplexity_sdk-*-cp312-abi3-*.whl; do
+              basename "$w" .whl | awk -F- '{print $NF}'
+            done | LC_ALL=C sort
+          )"
+          if [ "$actual_tags" != "$expected_tags" ]; then
+            echo "dist/ wheel platform tags do not match the expected set:" >&2
+            ls -l dist >&2
+            exit 1
+          fi
+
+          expected_files="$(
+            {
+              echo metadata.json
+              for tag in $expected_tags; do
+                echo "perplexity_sdk-${version}-cp312-abi3-${tag}.whl"
+              done
+            } | LC_ALL=C sort
+          )"
+          actual_files="$( (cd dist && printf '%s\n' *) | LC_ALL=C sort)"
+          if [ "$actual_files" != "$expected_files" ]; then
+            echo "dist/ must contain exactly metadata.json and the four ${version} wheels; found:" >&2
+            ls -l dist >&2
+            exit 1
+          fi
+
+          # Cross-check every wheel against metadata.json's recorded hashes.
+          for w in dist/perplexity_sdk-*.whl; do
+            name="$(basename "$w")"
+            recorded="$(jq -er --arg f "$name" \
+              '.wheels[] | select(.filename == $f) | .sha256' dist/metadata.json)"
+            actual="$(sha256sum "$w" | awk '{print $1}')"
+            if [ "$recorded" != "$actual" ]; then
+              echo "sha256 mismatch for ${name}: metadata.json says ${recorded}, file is ${actual}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Generate manifest.json and SHA256SUMS
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="$(jq -r '.version // empty' dist/metadata.json)"
+          commit="$(jq -r '.source_commit // empty' dist/metadata.json)"
+          [ -n "$version" ] || { echo "dist/metadata.json is missing version" >&2; exit 1; }
+          [ -n "$commit" ] || { echo "dist/metadata.json is missing source_commit" >&2; exit 1; }
+
+          mkdir -p staging
+          cp dist/perplexity_sdk-*.whl staging/
+
+          wheel_json() {
+            jq -n --arg asset "$1" \
+              --arg sha256 "$(sha256sum "dist/$1" | awk '{print $1}')" \
+              --argjson size "$(stat -c %s "dist/$1")" \
+              '{asset: $asset, sha256: $sha256, size: $size}'
+          }
+
+          # Keyed by PEP 425 wheel tag (python-abi-platform), so installers
+          # can match sys tags directly against manifest keys.
+          jq -n \
+            --arg version "$version" \
+            --arg tag "$RELEASE_TAG" \
+            --arg commit "$commit" \
+            --argjson linux_x86_64 "$(wheel_json "perplexity_sdk-${version}-cp312-abi3-manylinux2014_x86_64.whl")" \
+            --argjson linux_arm64 "$(wheel_json "perplexity_sdk-${version}-cp312-abi3-manylinux2014_aarch64.whl")" \
+            --argjson macos_x86_64 "$(wheel_json "perplexity_sdk-${version}-cp312-abi3-macosx_11_0_x86_64.whl")" \
+            --argjson macos_arm64 "$(wheel_json "perplexity_sdk-${version}-cp312-abi3-macosx_11_0_arm64.whl")" \
+            '{version: $version, tag: $tag, commit: $commit, wheels: {
+                "cp312-abi3-manylinux2014_x86_64": $linux_x86_64,
+                "cp312-abi3-manylinux2014_aarch64": $linux_arm64,
+                "cp312-abi3-macosx_11_0_x86_64": $macos_x86_64,
+                "cp312-abi3-macosx_11_0_arm64": $macos_arm64}}' \
+            > staging/manifest.json
+
+          (cd staging && sha256sum perplexity_sdk-*.whl manifest.json > SHA256SUMS)
+
+          cat staging/manifest.json
+          cat staging/SHA256SUMS
+
+      - name: Upload staged assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets
+          path: staging/
+          retention-days: 7
+
+  # macosx_11_0_x86_64 has NO GitHub-hosted runner (Intel macOS images past
+  # macos-13 are retired), so that wheel ships UNSMOKED: it is checksum- and
+  # metadata-verified in `stage`, but never pip-installed in CI.
+  smoke:
+    name: Smoke test ${{ matrix.name }}
+    needs: stage
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            runner: macos-15
+            platform_tag: macosx_11_0_arm64
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            platform_tag: manylinux2014_x86_64
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            platform_tag: manylinux2014_aarch64
+
+    steps:
+      - name: Download staged assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-assets
+          path: staging
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install wheel and check version
+        run: |
+          set -euo pipefail
+
+          expected="$(jq -r '.version' staging/manifest.json)"
+          wheel="staging/perplexity_sdk-${expected}-cp312-abi3-${{ matrix.platform_tag }}.whl"
+          [ -f "$wheel" ] || { echo "missing $wheel" >&2; exit 1; }
+
+          python -m venv smoke-venv
+          # Deliberately online: the runtime dependency (orjson) resolves
+          # from PyPI exactly as it will for end users.
+          ./smoke-venv/bin/pip install "$wheel"
+          ./smoke-venv/bin/python -c "import sys, pplx_sdk; assert pplx_sdk.__version__ == sys.argv[1], pplx_sdk.__version__; print('pplx_sdk', pplx_sdk.__version__, 'OK')" "$expected"
+
+  publish:
+    name: Upload release assets
+    needs:
+      - stage
+      - smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write # dispatch publish-pypi.yml after undrafting
+    if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && (inputs.tag_name != '' || startsWith(github.ref, 'refs/tags/v'))) }}
+
+    steps:
+      # Everything uploaded comes from the staged artifact: the exact bytes
+      # that passed verification and smoke, no re-checkout needed.
+      - name: Download staged assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-assets
+          path: staging
+
+      - name: Upload release assets and publish
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "$RELEASE_TAG" \
+            staging/perplexity_sdk-*.whl \
+            staging/manifest.json \
+            staging/SHA256SUMS \
+            --clobber
+
+          # Publish only once every asset is in place. Pipelines for different
+          # tags run concurrently, so claim `latest` only when this tag
+          # version-sorts above every OTHER published vA.B.C — an older run
+          # finishing last must not steal releases/latest. Excluding this
+          # run's own tag keeps a re-dispatch on an already-published release
+          # (recovery path) from DEMOTING the current latest.
+          max_other="$(gh api --paginate "repos/$GH_REPO/releases" \
+            | jq -r '.[] | select(.draft == false) | .tag_name' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | { grep -vx "$RELEASE_TAG" || true; } | sort -V | tail -n 1)"
+          max_other="${max_other:-v0.0.0}"
+          top="$(printf '%s\n%s\n' "$RELEASE_TAG" "$max_other" | sort -V | tail -n 1)"
+          latest_flag="--latest=false"
+          if [[ "$top" == "$RELEASE_TAG" ]]; then
+            latest_flag="--latest"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false "$latest_flag"
+
+      # GITHUB_TOKEN-published releases fire NO `release: published` workflow
+      # runs (GitHub suppresses workflow-triggering events from workflow
+      # tokens), so the PyPI upload must be dispatched explicitly. The
+      # `release: published` trigger on publish-pypi.yml still covers
+      # hand-published releases.
+      - name: Dispatch PyPI publish
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish-pypi.yml --ref main -f tag_name="$RELEASE_TAG"
+          echo "Dispatched publish-pypi.yml for $RELEASE_TAG"
