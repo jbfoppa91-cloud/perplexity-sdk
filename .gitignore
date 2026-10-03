@@ -9,11 +9,10 @@ __pycache__/
 .venv/
 venv/
 
-# Packaging scratch (dist/metadata.json is tracked on purpose)
+# Packaging scratch. dist/ is NOT ignored: the release-sync job commits
+# metadata.json and the four platform wheels there (see cut-release.yml).
 build/
 *.egg-info/
-dist/*.whl
-dist/*.tar.gz
 
 # Coverage and editors
 .coverage
