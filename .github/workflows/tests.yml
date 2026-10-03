@@ -1,0 +1,36 @@
+# Runs the python-pep8-reviewer skill's test suite on every push and PR.
+# The suite cross-checks the scanner against flake8 + pep8-naming +
+# flake8-docstrings, then the scanner must pass its own scan.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pep8-reviewer:
+    name: python-pep8-reviewer (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.10", "3.12", "3.14"]
+    defaults:
+      run:
+        working-directory: skills/python-pep8-reviewer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest flake8 pep8-naming flake8-docstrings
+      - name: Run the test suite (includes flake8 cross-checks)
+        run: python -m pytest tests -q
+      - name: Scanner passes its own scan
+        run: python scripts/pep8_review.py scripts tests/test_pep8_review.py
