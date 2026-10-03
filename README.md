@@ -66,6 +66,9 @@ wheel, not this tree).
   per-wheel SHA-256 hashes. Its version, the PyPI version, and the git tag
   (`v{version}`) are always the same.
 - `examples/` and `.github/` — owned and edited in this repository.
+- `skills/` — agent skills in agentskills.io format, each with a `SKILL.md`
+  (see `skills/python-pep8-reviewer/` and
+  `skills/marbella-ethical-social-conversation/`).
 
 ## License
 
