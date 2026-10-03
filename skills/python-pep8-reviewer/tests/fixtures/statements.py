@@ -27,7 +27,7 @@ class Case(unittest.TestCase):
             pass
         if self.value: print(self.value)
         else: pass
-        fn = lambda: 1  # noqa-ish
+        fn = lambda: 1  # kept as a lambda on purpose
         return fn
 
 

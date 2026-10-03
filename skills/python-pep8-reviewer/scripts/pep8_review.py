@@ -4,7 +4,10 @@
 Not a substitute for the judgment pass in SKILL.md. Does not score
 quote style or hanging-indent style. Rule codes follow pycodestyle
 (E/W), pyflakes (F403), pep8-naming (N8xx) and pydocstyle (Dxxx);
-I001 is this script's own import-group check.
+I001 is this script's own import-group check. The blank-line,
+operator-whitespace, ambiguous-name and lambda checks are ports of
+pycodestyle's logical-line checks and skip what flake8 ignores by
+default (E226, E704).
 
 Exit codes: 0 no findings, 1 findings, 2 no Python files to scan.
 """
@@ -15,6 +18,7 @@ import argparse
 import ast
 import io
 import json
+import keyword
 import re
 import sys
 import tokenize
@@ -128,6 +132,35 @@ new number optional placeholder reference result same schema setup
 should simple some special sql standard static string subclasses that
 the these this true unique unit utility what wrapper
 """.split())
+
+# pycodestyle's logical-line vocabulary.
+TOP_LEVEL_RE = re.compile(r"^(async\s+def\s+|def\s+|class\s+|@)")
+DEF_RE = re.compile(r"^(async\s+def|def)\b")
+DOCSTRING_RE = re.compile(r"u?r?[\"']")
+LAMBDA_RE = re.compile(r"\blambda\b")
+SKIP_TOKENS = frozenset(
+    {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}
+)
+SKIP_COMMENTS = SKIP_TOKENS | {tokenize.COMMENT, tokenize.ERRORTOKEN}
+FSTRING_START = getattr(tokenize, "FSTRING_START", -1)
+FSTRING_END = getattr(tokenize, "FSTRING_END", -1)
+TSTRING_START = getattr(tokenize, "TSTRING_START", -1)
+TSTRING_END = getattr(tokenize, "TSTRING_END", -1)
+STRING_MIDDLE = {
+    getattr(tokenize, "FSTRING_MIDDLE", -1),
+    getattr(tokenize, "TSTRING_MIDDLE", -1),
+}
+WS_NEEDED = frozenset({
+    "**=", "*=", "/=", "//=", "+=", "-=", "!=", "<", ">", "%=", "^=",
+    "&=", "|=", "==", "<=", ">=", "<<=", ">>=", "=", "and", "in", "is",
+    "or", "->", ":=",
+})
+UNARY = frozenset({">>", "**", "*", "+", "-"})
+ARITHMETIC = frozenset({"**", "*", "/", "//", "+", "-", "@"})
+WS_OPTIONAL = ARITHMETIC | {"^", "&", "|", "<<", ">>", "%"}
+KEYWORDS = frozenset(keyword.kwlist + ["print"]) - {"False", "None", "True"}
+AMBIGUOUS = ("l", "O", "I")
+is_soft_keyword = getattr(keyword, "issoftkeyword", lambda word: False)
 
 # Fallback for Python < 3.10, which lacks sys.stdlib_module_names.
 STDLIB_FALLBACK = frozenset("""
@@ -425,7 +458,6 @@ def ast_findings(path: Path, tree: ast.Module, text: str) -> list[dict]:
                 item(path, node.lineno, "E722",
                      "bare 'except:'; name the exception")
             )
-    findings.extend(blank_lines_before_top_level(path, tree, text))
     findings.extend(imports_not_at_top(path, tree))
     findings.extend(import_groups(path, tree))
     findings.extend(naming_findings(path, tree))
@@ -459,53 +491,6 @@ def compare_findings(path: Path, node: ast.Compare) -> list[dict]:
                          "do not compare to True or False with ==")
                 )
         left = right
-    return found
-
-
-def comment_only_lines(text: str) -> set[int]:
-    """Return line numbers that hold only a comment."""
-    rows = set()
-    try:
-        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
-        for tok in tokens:
-            if tok.type == tokenize.COMMENT and not tok.line[
-                : tok.start[1]
-            ].strip():
-                rows.add(tok.start[0])
-    except (tokenize.TokenError, SyntaxError):
-        pass
-    return rows
-
-
-def blank_lines_before_top_level(
-    path: Path, tree: ast.Module, text: str
-) -> list[dict]:
-    """E302: two blank lines before every top-level def or class.
-
-    Count from the first decorator, skip comment-only lines, and
-    apply after imports and other statements, not only other defs.
-    """
-    found = []
-    lines = text.splitlines()
-    comments = comment_only_lines(text)
-    for node in tree.body:
-        if not isinstance(node, DEF_NODES):
-            continue
-        start = min([node.lineno] + [d.lineno for d in node.decorator_list])
-        blanks, row = 0, start - 1
-        while row >= 1:
-            current = lines[row - 1]
-            if not current.strip():
-                blanks += 1
-            elif row not in comments:
-                break
-            row -= 1
-        if row >= 1 and blanks < 2:
-            found.append(
-                item(path, start, "E302",
-                     f"expected 2 blank lines before top-level "
-                     f"definition, found {blanks}")
-            )
     return found
 
 
@@ -562,6 +547,455 @@ def import_groups(path: Path, tree: ast.Module) -> list[dict]:
             ]
         last = rank
     return []
+
+
+# ----------------------------------------------------------------------
+# Logical lines (ports of pycodestyle checks)
+# ----------------------------------------------------------------------
+
+
+def expand_indent(line: str) -> int:
+    """Return the indentation width; tabs expand to multiples of 8."""
+    line = line.rstrip("\n\r")
+    if "\t" not in line:
+        return len(line) - len(line.lstrip())
+    result = 0
+    for char in line:
+        if char == "\t":
+            result = result // 8 * 8 + 8
+        elif char == " ":
+            result += 1
+        else:
+            break
+    return result
+
+
+def mute_string(text: str) -> str:
+    """Replace string contents with x's so syntax inside is ignored."""
+    start = text.index(text[-1]) + 1
+    end = len(text) - 1
+    if text[-3:] in ('"""', "'''"):
+        start += 2
+        end -= 2
+    return text[:start] + "x" * (end - start) + text[end:]
+
+
+def build_logical_line(tokens: list, lines: list[str]) -> tuple:
+    """Join a logical line's tokens into one string (pycodestyle style).
+
+    Return (logical line, start position); the position is None when
+    the tokens hold no code or comment.
+    """
+    logical: list[str] = []
+    first = None
+    prev_row = prev_col = None
+    for tok in tokens:
+        if tok.type in SKIP_TOKENS:
+            continue
+        if first is None:
+            first = tok.start
+        if tok.type == tokenize.COMMENT:
+            continue
+        text, end = tok.string, tok.end
+        if tok.type == tokenize.STRING:
+            text = mute_string(text)
+        elif tok.type in STRING_MIDDLE:
+            braces = text.count("{") + text.count("}")
+            text = "x" * (len(text) + braces)
+            end = (end[0], end[1] + braces)
+        if prev_row:
+            start_row, start_col = tok.start
+            if prev_row != start_row:
+                prev_line = lines[prev_row - 1]
+                prev_text = prev_line[prev_col - 1:prev_col]
+                if prev_text == "," or (
+                    prev_text not in "{[(" and text not in "}])"
+                ):
+                    text = " " + text
+            elif prev_col != start_col:
+                text = tok.line[prev_col:start_col] + text
+        logical.append(text)
+        prev_row, prev_col = end
+    return "".join(logical), first
+
+
+def logical_findings(path: Path, text: str) -> list[dict]:
+    """Drive the logical-line checks over the token stream."""
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return []
+    lines = text.splitlines(True)
+    state = {
+        "blank_lines": 0,
+        "blank_before": 0,
+        "previous_logical": "",
+        "previous_indent_level": 0,
+        "previous_unindented": "",
+    }
+    findings: list[dict] = []
+    parens = 0
+    current: list = []
+    for tok in tokens:
+        if tok.start[0] > len(lines):
+            break  # ENDMARKER and trailing DEDENTs sit past the last line
+        current.append(tok)
+        if tok.type == tokenize.OP:
+            if tok.string in "([{":
+                parens += 1
+            elif tok.string in "}])":
+                parens -= 1
+        elif not parens and tok.type in (tokenize.NEWLINE, tokenize.NL):
+            if tok.type == tokenize.NEWLINE:
+                findings.extend(check_logical(path, current, lines, state))
+                state["blank_before"] = 0
+            elif len(current) == 1:
+                state["blank_lines"] += 1
+            else:
+                findings.extend(check_logical(path, current, lines, state))
+            current = []
+    if current:
+        findings.extend(check_logical(path, current, lines, state))
+    return findings
+
+
+def check_logical(path: Path, tokens: list, lines: list[str], state: dict):
+    """Run the per-logical-line checks and update the running state."""
+    logical, first = build_logical_line(tokens, lines)
+    if first is None:
+        return []
+    start_row, start_col = first
+    indent_level = expand_indent(lines[start_row - 1][:start_col])
+    if state["blank_before"] < state["blank_lines"]:
+        state["blank_before"] = state["blank_lines"]
+    line_number = min(tokens[-1].end[0], len(lines))
+    found = blank_lines_check(
+        path, logical, indent_level, line_number, lines, state, start_row
+    )
+    found.extend(whitespace_check(path, tokens))
+    found.extend(ambiguous_check(path, tokens))
+    found.extend(statement_checks(path, logical, tokens, start_row))
+    if logical:
+        state["previous_indent_level"] = indent_level
+        state["previous_logical"] = logical
+        if not indent_level:
+            state["previous_unindented"] = logical
+    state["blank_lines"] = 0
+    return found
+
+
+def is_one_liner(logical: str, indent_level: int, lines, line_number) -> bool:
+    """Return True for a one-line def in a group of one-liners."""
+    if not TOP_LEVEL_RE.match(logical):
+        return False
+    line_idx = line_number - 1
+    prev_indent = expand_indent(lines[line_idx - 1]) if line_idx >= 1 else 0
+    if prev_indent > indent_level:
+        return False
+    while line_idx < len(lines):
+        line = lines[line_idx].strip()
+        if not line.startswith("@") and TOP_LEVEL_RE.match(line):
+            break
+        line_idx += 1
+    else:
+        return False
+    next_idx = line_idx + 1
+    while next_idx < len(lines):
+        if lines[next_idx].strip():
+            break
+        next_idx += 1
+    else:
+        return True
+    return expand_indent(lines[next_idx]) <= indent_level
+
+
+def blank_lines_check(
+    path: Path, logical: str, indent_level: int, line_number: int,
+    lines: list[str], state: dict, row: int,
+) -> list[dict]:
+    """E301-E306: blank lines around definitions and decorators."""
+    blank_lines = state["blank_lines"]
+    blank_before = state["blank_before"]
+    previous = state["previous_logical"]
+    if not previous and blank_before < 2:
+        return []
+    if previous.startswith("@"):
+        if blank_lines:
+            return [
+                item(path, row, "E304",
+                     "blank lines found after function decorator")
+            ]
+        return []
+    if blank_lines > 2 or (indent_level and blank_lines == 2):
+        return [
+            item(path, row, "E303", f"too many blank lines ({blank_lines})")
+        ]
+    if TOP_LEVEL_RE.match(logical):
+        if blank_before == 0 and is_one_liner(
+            logical, indent_level, lines, line_number
+        ):
+            return []
+        if indent_level:
+            if (
+                blank_before == 1
+                or state["previous_indent_level"] < indent_level
+                or DOCSTRING_RE.match(previous)
+            ):
+                return []
+            ancestor_level = indent_level
+            nested = None
+            for line in lines[line_number - 2::-1]:
+                if line.strip() and expand_indent(line) < ancestor_level:
+                    ancestor_level = expand_indent(line)
+                    nested = DEF_RE.match(line.lstrip())
+                    if nested or ancestor_level == 0:
+                        break
+            if nested:
+                return [
+                    item(path, row, "E306",
+                         "expected 1 blank line before a nested "
+                         "definition, found 0")
+                ]
+            return [item(path, row, "E301", "expected 1 blank line, found 0")]
+        if blank_before != 2:
+            return [
+                item(path, row, "E302",
+                     f"expected 2 blank lines, found {blank_before}")
+            ]
+        return []
+    if (
+        logical
+        and not indent_level
+        and blank_before != 2
+        and state["previous_unindented"].startswith(("def ", "class "))
+    ):
+        return [
+            item(path, row, "E305",
+                 f"expected 2 blank lines after class or function "
+                 f"definition, found {blank_before}")
+        ]
+    return []
+
+
+def whitespace_check(path: Path, tokens: list) -> list[dict]:
+    """E225, E227, E228, E231: whitespace around operators and commas.
+
+    E226 (arithmetic operators without spaces) is skipped because
+    flake8 ignores it by default and PEP 8 allows ``x*x + y*y``.
+    """
+    found = []
+    need_space: object = False
+    prev_type = tokenize.OP
+    prev_text = prev_end = None
+    brace_stack: list[str] = []
+    for tok in tokens:
+        token_type, text, start, end, line = tok
+        if token_type == tokenize.OP and text in {"[", "(", "{"}:
+            brace_stack.append(text)
+        elif token_type == FSTRING_START:
+            brace_stack.append("f")
+        elif token_type == TSTRING_START:
+            brace_stack.append("t")
+        elif token_type == tokenize.NAME and text == "lambda":
+            brace_stack.append("l")
+        elif brace_stack:
+            if token_type == tokenize.OP and text in {"]", ")", "}"}:
+                brace_stack.pop()
+            elif token_type in (FSTRING_END, TSTRING_END):
+                brace_stack.pop()
+            elif (
+                brace_stack[-1] == "l"
+                and token_type == tokenize.OP
+                and text == ":"
+            ):
+                brace_stack.pop()
+        if token_type in SKIP_COMMENTS:
+            continue
+        if token_type == tokenize.OP and text in {",", ";", ":"}:
+            next_char = line[end[1]:end[1] + 1]
+            if next_char not in {" ", "\t", "\xa0"} and (
+                next_char not in "\r\n"
+            ):
+                if text == ":" and brace_stack[-1:] == ["["]:
+                    pass
+                elif text == ":" and brace_stack[-2:] in (
+                    ["f", "{"], ["t", "{"]
+                ):
+                    pass
+                elif text == "," and next_char in ")]":
+                    pass
+                else:
+                    found.append(
+                        item(path, start[0], "E231",
+                             f"missing whitespace after '{text}'")
+                    )
+        if need_space:
+            if start != prev_end:
+                if need_space is not True and not need_space[1]:
+                    found.append(
+                        item(path, need_space[0][0], "E225",
+                             "missing whitespace around operator")
+                    )
+                need_space = False
+            elif (prev_text == "/" and text in {",", ")", ":"}) or (
+                prev_text == ")" and text == ":"
+            ):
+                pass
+            else:
+                if need_space is True or need_space[1]:
+                    found.append(
+                        item(path, prev_end[0], "E225",
+                             "missing whitespace around operator")
+                    )
+                elif prev_text != "**":
+                    if prev_text == "%":
+                        found.append(
+                            item(path, need_space[0][0], "E228",
+                                 "missing whitespace around modulo "
+                                 "operator")
+                        )
+                    elif prev_text not in ARITHMETIC:
+                        found.append(
+                            item(path, need_space[0][0], "E227",
+                                 "missing whitespace around bitwise or "
+                                 "shift operator")
+                        )
+                need_space = False
+        elif (
+            token_type in (tokenize.OP, tokenize.NAME)
+            and prev_end is not None
+        ):
+            if text == "=" and (
+                brace_stack[-1:] in (["l"], ["("])
+                or brace_stack[-2:] in (["f", "{"], ["t", "{"])
+            ):
+                pass
+            elif text in WS_NEEDED:
+                need_space = True
+            elif text in UNARY:
+                if (prev_type == tokenize.OP and prev_text in "}])") or (
+                    prev_type != tokenize.OP
+                    and prev_text not in KEYWORDS
+                    and not is_soft_keyword(prev_text)
+                ):
+                    need_space = None
+            elif text in WS_OPTIONAL:
+                need_space = None
+            if need_space is None:
+                need_space = (prev_end, start != prev_end)
+            elif need_space and start == prev_end:
+                found.append(
+                    item(path, prev_end[0], "E225",
+                         "missing whitespace around operator")
+                )
+                need_space = False
+        prev_type = token_type
+        prev_text = text
+        prev_end = end
+    return found
+
+
+def ambiguous_check(path: Path, tokens: list) -> list[dict]:
+    """E741-E743: names l, O and I that look like digits."""
+    found = []
+    func_depth = None
+    seen_colon = False
+    brace_depth = 0
+    prev_text = tokens[0].string
+    prev_start = tokens[0].start
+    for index in range(1, len(tokens)):
+        token_type, text, start, end, line = tokens[index]
+        ident = pos = None
+        if prev_text in {"def", "lambda"}:
+            func_depth = brace_depth
+            seen_colon = False
+        elif (
+            func_depth is not None
+            and text == ":"
+            and brace_depth == func_depth
+        ):
+            seen_colon = True
+        if text and text in "([{":
+            brace_depth += 1
+        elif text and text in ")]}":
+            brace_depth -= 1
+        if text == ":=" or (text == "=" and brace_depth == 0):
+            if prev_text in AMBIGUOUS:
+                ident, pos = prev_text, prev_start
+        if prev_text in ("as", "for", "global", "nonlocal"):
+            if text in AMBIGUOUS:
+                ident, pos = text, start
+        if (
+            func_depth is not None
+            and not seen_colon
+            and index < len(tokens) - 1
+            and tokens[index + 1].string in ":,=)"
+            and prev_text in {"lambda", ",", "*", "**", "("}
+            and text in AMBIGUOUS
+        ):
+            ident, pos = text, start
+        if prev_text == "class" and text in AMBIGUOUS:
+            found.append(
+                item(path, start[0], "E742",
+                     f"ambiguous class definition '{text}'")
+            )
+        if prev_text == "def" and text in AMBIGUOUS:
+            found.append(
+                item(path, start[0], "E743",
+                     f"ambiguous function definition '{text}'")
+            )
+        if ident:
+            found.append(
+                item(path, pos[0], "E741",
+                     f"ambiguous variable name '{ident}'")
+            )
+        prev_text = text
+        prev_start = start
+    return found
+
+
+def statement_checks(path: Path, logical: str, tokens: list, row: int):
+    """E731 lambda assignment; E702/E703 semicolons."""
+    found = []
+    last_char = len(logical) - 1
+    colon = logical.find(":")
+    prev_found = 0
+    counts = {char: 0 for char in "{}[]()"}
+    while -1 < colon < last_char:
+        for char in logical[prev_found:colon]:
+            if char in counts:
+                counts[char] += 1
+        if (
+            counts["{"] <= counts["}"]
+            and counts["["] <= counts["]"]
+            and counts["("] <= counts[")"]
+            and logical[colon + 1] != "="
+        ):
+            lambda_kw = LAMBDA_RE.search(logical, 0, colon)
+            if lambda_kw:
+                before = logical[: lambda_kw.start()].rstrip()
+                if before[-1:] == "=" and before[:-1].strip().isidentifier():
+                    found.append(
+                        item(path, row, "E731",
+                             "do not assign a lambda expression, use a def")
+                    )
+                break
+        prev_found = colon
+        colon = logical.find(":", colon + 1)
+    code_tokens = [t for t in tokens if t.type not in SKIP_COMMENTS]
+    for index, tok in enumerate(code_tokens):
+        if tok.type == tokenize.OP and tok.string == ";":
+            if index == len(code_tokens) - 1:
+                found.append(
+                    item(path, tok.start[0], "E703",
+                         "statement ends with a semicolon")
+                )
+            else:
+                found.append(
+                    item(path, tok.start[0], "E702",
+                         "multiple statements on one line (semicolon)")
+                )
+    return found
 
 
 # ----------------------------------------------------------------------
@@ -1073,6 +1507,7 @@ def review_file(path: Path, limit: int, doc_limit: int) -> list[dict]:
         )
         return findings
     findings.extend(token_findings(path, text, doc_limit))
+    findings.extend(logical_findings(path, text))
     findings.extend(ast_findings(path, tree, text))
     return findings
 

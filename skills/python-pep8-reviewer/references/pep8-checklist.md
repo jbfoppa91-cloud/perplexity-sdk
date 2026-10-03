@@ -8,7 +8,7 @@ Read this on the judgment pass. PEP 8 is the style guide; PEP 257 covers docstri
 |---|---|
 | Indent | 4 spaces. No tabs. No mixed tabs and spaces. |
 | Continuation | Align with the opening delimiter, or hanging indent of 4 spaces. Do not indent the continuation argument and the closing paren on the same visual column as the first argument when that hides structure. |
-| Blank lines | 2 between top-level functions and classes. 1 between methods. 2 around top-level constant groups is fine. |
+| Blank lines | 2 between top-level functions and classes (E302) and after them (E305). 1 between methods (E301) and before nested defs (E306). Not more than 2 anywhere, not more than 1 inside a def (E303). None after a decorator (E304). A run of one-line defs may skip them. |
 | Line length | 79 code, 72 comments and docstrings, unless the project sets another limit. URLs may run long. |
 | Encoding | UTF-8. No coding cookie required on Python 3. |
 | File end | Single trailing newline. No trailing whitespace. |
@@ -30,7 +30,8 @@ Group in this order, each group separated by one blank line:
 
 - Space after commas, colons, and semicolons. Not before.
 - Space around `=` in assignments and keyword-only defaults, not inside function-call keyword arguments that are already spaced as the project formatter wants. PEP 8: no spaces around `=` when used to indicate a keyword argument or a default parameter (`def f(a=1):`, `f(a=1)`).
-- Space around binary operators. A line may drop spaces around operators with the lowest priority to show structure (`hypot2 = x*x + y*y`).
+- Space around binary operators (E225). Assignment, augmented assignment, comparisons, `->` and `:=` always need them. Arithmetic may drop spaces to show priority (`hypot2 = x*x + y*y`), but bitwise, shift and `%` operators without spaces are flagged (E227, E228).
+- Space after commas, semicolons and colons (E231), except in slices, `(3,)` and f-string format specs.
 - No space immediately inside parentheses, brackets, or braces.
 - Slice colons: `ham[1:9]`, `ham[lower:]`, `ham[lower:upper:step]`.
 - At least two spaces before an inline comment, then `# ` with a space.
@@ -56,6 +57,7 @@ Do not flag dunder names, or a leading underscore used as "unused".
 - `is` / `is not` for `None`, not `==` / `!=`.
 - Do not compare booleans with `== True` or `== False`. Write `if flag:` / `if not flag:`.
 - `is not` as two words, never `not ... is`.
+- Never name a variable `l`, `O` or `I` (E741). Do not assign a lambda to a name; write a `def` (E731). One statement per line; no trailing semicolons (E702, E703).
 - Exceptions: `except ValueError:` not bare `except:`.
 - Context managers for resources.
 

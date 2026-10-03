@@ -25,3 +25,4 @@
 - Test suite: `tests/test_pep8_review.py` (43 tests) with fixtures cross-checked against flake8 + pep8-naming + flake8-docstrings.
 - Verified on real projects: `perplexity-sdk` (11 files) and `psf/requests` (34 files, 1,308 shared findings) with zero disagreements against flake8 on every implemented code.
 - Runs on Python 3.8+: `ast.Match` guarded, stdlib fallback list for Python < 3.10 (which lacks `sys.stdlib_module_names`). Test suite verified on 3.8, 3.10, 3.12 and 3.14.
+- Logical-line checks ported from pycodestyle: E301/E302/E303/E304/E305/E306 blank lines (replaces the AST-based E302), E225/E227/E228/E231 operator and comma whitespace, E741/E742/E743 ambiguous names, E731 lambda assignment, E702/E703 semicolons. E226 and E704 are deliberately not reported (flake8 default ignores). Verified at parity with flake8 on the fixtures, `perplexity-sdk` and `psf/requests`; 49 tests.

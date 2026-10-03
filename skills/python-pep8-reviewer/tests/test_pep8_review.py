@@ -66,8 +66,11 @@ def flake8_available() -> bool:
 # Codes the script implements and flake8 (with plugins) also reports.
 SHARED_CODES = {
     "W191", "W291", "W292", "W293", "W505",
-    "E101", "E111", "E261", "E302", "E401", "E402", "E501", "E701",
+    "E101", "E111", "E261", "E401", "E402", "E501", "E701",
     "E711", "E712", "E722", "F403", "E999",
+    "E301", "E302", "E303", "E304", "E305", "E306",
+    "E225", "E227", "E228", "E231", "E702", "E703", "E731",
+    "E741", "E742", "E743",
     "N801", "N802", "N803", "N804", "N805", "N806", "N815", "N816", "N818",
     "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",
     "D200", "D205", "D209", "D300", "D400", "D401", "D419",
@@ -636,6 +639,192 @@ def test_variable_names_by_scope(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# Blank lines, operator whitespace, ambiguous names, lambdas
+# ----------------------------------------------------------------------
+
+
+def test_blank_line_rules(tmp_path):
+    """Check blank line rules E301 to E306."""
+    source = '''
+    """Module."""
+    import os
+    def after_import():
+        """E302, found 0."""
+        return os.sep
+
+
+
+    def three_blanks():
+        """E303."""
+    value = three_blanks()
+
+
+    class Holder:
+        """Doc."""
+        attr = 1
+        def first(self):
+            """E301."""
+
+
+        def second(self):
+            """E303 inside a class."""
+            def inner():
+                return 1
+            def inner_two():
+                return 2
+            return inner, inner_two
+
+        @property
+
+        def third(self):
+            """E304."""
+            return 3
+
+        def _one(self): return 1
+        def _two(self): return 2
+    '''
+    # the two one-liners at the end are a permitted group (no E301)
+    assert scan(tmp_path, source) == [
+        (3, "E302"),
+        (9, "E303"),
+        (11, "E305"),
+        (17, "E301"),
+        (21, "E303"),
+        (25, "E306"),
+        (31, "E304"),
+    ]
+
+
+def test_operator_whitespace(tmp_path):
+    """Check E225, E227, E228 and E231 with the usual exemptions."""
+    source = '''
+    """Module."""
+
+
+    def compute(a, b=1, *args, c: int = 2, **kwargs) -> int:
+        """Doc."""
+        x=1
+        y = x+1
+        z = x *2
+        w = x|y
+        msg = "%d"%z
+        items = [x,y, z, w, msg]
+        fine = {"a": 1, "b": [1, 2][0:1]}
+        also_fine = fine["a"] if fine else -1
+        call = dict(a=1, b=-2, c=+3, *args, **kwargs)
+        spaced = (1, -1, *[2])
+        label = f"{fine!r:>10}"
+        return len(items) + len(call) + len(spaced) + len(label) + a + b + c
+
+
+    def positional(a, /, b):
+        """Doc."""
+        return a - b
+    '''
+    assert scan(tmp_path, source) == [
+        (6, "E225"),
+        (8, "E225"),
+        (9, "E227"),
+        (10, "E228"),
+        (11, "E231"),
+    ]
+
+
+def test_ambiguous_names(tmp_path):
+    """Check E741, E742 and E743."""
+    source = '''
+    """Module."""
+
+    import os
+
+    l = 1
+    O = 2
+    I = 3
+    for l in range(3):
+        pass
+    with open(os.devnull) as l:
+        pass
+    try:
+        pass
+    except ValueError as O:
+        pass
+    func = lambda l: l
+    fine = dict(l=12)
+    also = lambda arg: arg * l
+
+
+    def params(l, O=1, *I):
+        """Doc."""
+        return l, O, I
+
+
+    def L(x):
+        """Doc."""
+        return x
+
+
+    class I:
+        """Doc."""
+
+
+    def l():
+        """Doc."""
+    '''
+    assert scan(tmp_path, source) == [
+        (5, "E741"),
+        (6, "E741"),
+        (7, "E741"),
+        (8, "E741"),
+        (10, "E741"),
+        (14, "E741"),
+        (16, "E731"),
+        (16, "E741"),
+        (18, "E731"),
+        (21, "E741"),
+        (21, "E741"),
+        (21, "E741"),
+        (21, "N803"),
+        (21, "N803"),
+        (26, "N802"),
+        (31, "E742"),
+        (35, "E743"),
+    ]
+
+
+def test_lambda_assignment_and_semicolons(tmp_path):
+    """Check E731, E702 and E703."""
+    source = '''
+    """Module."""
+
+    square = lambda n: n * n
+    do_one = 1; do_two = 2
+    do_three = 3;
+    mapping = {"key": lambda: 0}
+    '''
+    assert scan(tmp_path, source) == [
+        (3, "E731"),
+        (4, "E702"),
+        (5, "E703"),
+    ]
+
+
+def test_default_ignored_codes_are_not_reported(tmp_path):
+    """Check that E226 and E704, which flake8 ignores, stay silent."""
+    source = '''
+    """Module."""
+
+
+    def hypot2(x, y):
+        """Doc."""
+        return x*x + y*y
+
+
+    def _stub(): ...
+    '''
+    assert scan(tmp_path, source) == []
+
+
+# ----------------------------------------------------------------------
 # Regressions from the first review round
 # ----------------------------------------------------------------------
 
@@ -747,6 +936,7 @@ def test_layout_rules(tmp_path):
         (9, "W293"),
         (10, "E101"),
         (10, "E701"),
+        (11, "E305"),
         (11, "E402"),
         (13, "E302"),
         (14, "D103"),
