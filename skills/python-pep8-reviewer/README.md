@@ -10,6 +10,19 @@ Agent skill (agentskills.io format) that reviews Python code against PEP 8 and P
 
 The scanner has no dependencies beyond the standard library and runs on Python 3.8+. Files under `tests/fixtures/` are deliberately non-compliant test inputs.
 
+## Usage
+
+Run from this directory.
+
 ```bash
-python3 scripts/pep8_review.py path/to/package --line-length 88
+# Mechanical scan with defaults (line length 79, doc length 72)
+python3 scripts/pep8_review.py path/to/package
+
+# With custom limits (e.g., Black's line length of 88)
+python3 scripts/pep8_review.py path/to/package --line-length 88 --doc-length 72
+
+# Run the test suite
+python3 -m pytest tests
 ```
+
+Output is JSON: `{"files": N, "line_length": 79, "doc_length": 72, "findings": [{"path", "line", "code", "message"}, ...]}`. Exit code 0 means no findings, 1 means findings, 2 means no Python files were found.
