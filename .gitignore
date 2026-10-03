@@ -1,0 +1,23 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging scratch (dist/metadata.json is tracked on purpose)
+build/
+*.egg-info/
+dist/*.whl
+dist/*.tar.gz
+
+# Coverage and editors
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
